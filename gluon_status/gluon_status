@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# This software may be modified and distributed under the terms
+# of the MIT license.  See the LICENSE file for details.
+#
+#
+# This script queries the node info and statistics from respondd of
+# Freifunk routers with the Gluon firmware and prints interesting
+# information.
+# Tested with Gluon 2016.x and 2018.x and Python 3.7.
+#
+# Requires Python3 and Requests and BeautifulSoup4 packages.
+#
+# Example: python gluon_status '[2a03:2267:2::16cc:20ff:feb4:c774]' '[2001:608:a01:2:c6e9:84ff:fe5b:9e26]'
+
+
+from math import floor
+from os.path import basename
+from time import gmtime, strftime
+import json
+import sys
+
+import requests
+
+
+try:
+    from bs4 import BeautifulSoup
+    from bs4.element import Tag
+except ImportError:
+    BeautifulSoup = None
+
+
+NODEINFO_URL = 'http://{hostname}/cgi-bin/nodeinfo'
+STATUS_URL = 'http://{hostname}/cgi-bin/status'
+STATISTICS_URL = 'http://[{hostname}]/cgi-bin/dyn/statistics'
+PROXIES = dict(http=None, https=None)  # set a proxy if necessary
+TIMEOUT = (10.0, 10.0)
+UNKNOWN = '<unknown>'
+
+
+class GluonStatusPrinter:
+
+    # ----------------------------------------------------------------------
+    def __init__(self, hostname):
+        self._hostname = hostname
+        self._nodeinfo = None
+        self._statistics = None
+
+    # ----------------------------------------------------------------------
+    def print_status(self):
+        try:
+            self._fetch_nodeinfo()
+            self._fetch_statistics()
+        except requests.exceptions.RequestException as e:
+            print('Host "{}" not reachable: {}'.format(self._hostname, e), file=sys.stderr)
+            print()
+        else:
+            self._print()
+
+    # ----------------------------------------------------------------------
+    def _fetch_nodeinfo(self):
+        url = NODEINFO_URL.format(hostname=self._hostname)
+        session = self._factor_requests_session()
+        with session.get(url, proxies=PROXIES, timeout=TIMEOUT) as response:
+            response.encoding = 'utf-8' if response.encoding is None else response.encoding
+            if response.status_code == 404:
+                # newer Gluon versions (>= 2018.x) don't support the nodeinfo endpoint, so
+                # try to parse HTML :(
+                if BeautifulSoup is not None:
+                    status = self._fetch_status()
+                    self._nodeinfo = self._parse_html_to_nodeinfo(status)
+                else:
+                    print(
+                        'Host "{}": node information not found; install "beautifulsoup4" '
+                        'to gather node information from HTML'.format(self._hostname),
+                        file=sys.stderr)
+            else:
+                # evaluate the JSON response
+                self._nodeinfo = response.json()
+
+    # ----------------------------------------------------------------------
+    def _factor_requests_session(self):
+        session = requests.Session()
+        session.mount('http://', requests.adapters.HTTPAdapter(max_retries=3))
+        return session
+
+    # ----------------------------------------------------------------------
+    def _fetch_status(self):
+        url = STATUS_URL.format(hostname=self._hostname)
+        session = self._factor_requests_session()
+        with session.get(url, proxies=PROXIES, timeout=TIMEOUT) as response:
+            response.encoding = 'utf-8' if response.encoding is None else response.encoding
+            return response.text
+
+    # ----------------------------------------------------------------------
+    def _parse_html_to_nodeinfo(self, html_doc):
+        nodeinfo = dict(
+            node_id=UNKNOWN,
+            hardware=dict(model=UNKNOWN),
+            owner=dict(contact=UNKNOWN),
+            software=dict(firmware=dict(base=UNKNOWN, release=UNKNOWN)),
+            system=dict(site_code=None),
+        )
+        table = None
+
+        soup = BeautifulSoup(html_doc, 'html.parser')
+        # find the overview table
+        divs = soup.find_all('div', attrs={'class':'frame'})
+        for div in divs:
+            if table is not None:
+                break
+            for child in div.children:
+                if isinstance(child, Tag) and child.name == 'h2' and child.text == 'Overview':
+                    table = div
+                    break
+        # iterate all lines to find relevant information
+        elements = table.find('dl').children
+        key = None
+        for element in elements:
+            if key is not None and isinstance(element, Tag) and element.name == 'dd':
+                key = key.lower()
+                if key == 'node name':
+                    nodeinfo['hostname'] = element.text
+                if key == 'model':
+                    nodeinfo['hardware']['model'] = element.text
+                if key == 'firmware':
+                    nodeinfo['software']['firmware']['base'] = element.text
+            elif isinstance(element, Tag) and element.name == 'dt':
+                key = element.text
+
+        return nodeinfo
+
+    # ----------------------------------------------------------------------
+    def _fetch_statistics(self):
+        url = STATISTICS_URL.format(hostname=self._hostname)
+        session = self._factor_requests_session()
+        with session.get(url, stream=True, proxies=PROXIES, timeout=TIMEOUT) as response:
+            response.encoding = 'utf-8' if response.encoding is None else response.encoding
+            for line in response.iter_lines(decode_unicode=True):
+                # strip the "data: " prefix and parse the rest as JSON
+                payload = line[6:]
+                self._statistics = json.loads(payload)
+                # we are only interested in the first line any consecutive
+                # responses are statistics again
+                break
+
+    # ----------------------------------------------------------------------
+    def _print(self):
+        if self._nodeinfo is not None:
+            site_code = self._nodeinfo['system'].get('site_code')
+            if site_code:
+                hostname = '{} ({})'.format(self._nodeinfo['hostname'], site_code)
+            else:
+                hostname = self._nodeinfo['hostname']
+            node_id = self._nodeinfo['node_id']
+            firmware_base = self._nodeinfo['software']['firmware']['base']
+            firmware_release = self._nodeinfo['software']['firmware']['release']
+            owner = self._nodeinfo.get('owner', dict()).get('contact', UNKNOWN)
+            hardware = self._nodeinfo['hardware']['model']
+        else:
+            hostname = self._hostname
+            node_id = 'Node information not available, maybe too new firmware'
+            firmware_base = None
+            firmware_release = None
+            owner = None
+            hardware = None
+
+        memory_total = self._statistics['memory']['total'] / 1024
+        memory_free = self._statistics['memory']['free'] / 1024
+        memory_buffers = self._statistics['memory']['buffers'] / 1024
+        memory_used = memory_total - memory_free - memory_buffers
+
+        loadavg = self._statistics['loadavg']
+        processes_running = self._statistics['processes']['running']
+        processes_total = self._statistics['processes']['total']
+
+        uptime = self._format_uptime(self._statistics['uptime'])
+        rootfs_usage = self._statistics['rootfs_usage'] * 100
+        traffic_rx = self._statistics['traffic']['rx']['bytes'] / 1024 / 1024
+        traffic_tx = self._statistics['traffic']['tx']['bytes'] / 1024 / 1024
+
+        clients = dict(
+            clients_total=self._statistics['clients']['total'],
+            clients_wifi=self._statistics['clients']['wifi'])
+
+        print('{}'.format(hostname))
+        print('=' * len(hostname))
+        print('  Node ID {} / Owner: {}'.format(node_id, owner))
+        print('  Model: {} ({} {})'.format(hardware, firmware_base, firmware_release))
+        print('  Gateway: {}'.format(self._statistics['gateway']))
+        print()
+        print('  Uptime: {}'.format(uptime))
+        print('  Load: {} / Processes: {} / {}'.format(loadavg, processes_running, processes_total))
+        print('  Memory: {:.0f} MB / {:.0f} MB'.format(memory_used, memory_total))
+        print('  NVRAM: {:0.2f} %'.format(rootfs_usage))
+        print('  Clients: Total: {clients_total} Wifi: {clients_wifi}'.format(**clients))
+        print('  Traffic: Rx: {:0.2f} MB Tx: {:0.2f} MB'.format(traffic_rx, traffic_tx))
+        print()
+        print()
+
+    # ----------------------------------------------------------------------
+    def _format_uptime(self, value):
+        time_days = int(floor(value / 86400))
+        t_val = gmtime(value - (time_days * 86400))
+        return '{} days, {}'.format(time_days, strftime('%H:%M:%S', t_val))
+
+
+# ----------------------------------------------------------------------
+def main():
+    if len(sys.argv) < 2:
+        print('Usage: {} <hostname>...'.format(basename(__file__)), file=sys.stderr)
+        exit(1)
+
+    for hostname in sys.argv[1:]:
+        printer = GluonStatusPrinter(hostname)
+        printer.print_status()
+
+
+if __name__ == '__main__':
+    main()
