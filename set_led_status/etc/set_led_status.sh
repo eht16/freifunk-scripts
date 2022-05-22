@@ -16,6 +16,7 @@
 # In doubt, see https://openwrt.org/docs/guide-user/base-system/led_configuration#led_triggers.
 
 
+LED_COLOR="green"
 THRESHOLD_LOW_MEMORY=3072 # 3 MB
 THRESHOLD_HIGH_LOAD=0.8
 THRESHOLD_NVRAM_USAGE=0.85 # 85 %
@@ -119,8 +120,8 @@ set_led_status() {
 	status=$2
 	trigger=$3
 
-	echo "${trigger}" > /sys/class/leds/tp-link:green:${led}/trigger
-	echo "${status}" > /sys/class/leds/tp-link:green:${led}/brightness
+	echo "${trigger}" > /sys/class/leds/tp-link:${LED_COLOR}:${led}/trigger
+	echo "${status}" > /sys/class/leds/tp-link:${LED_COLOR}:${led}/brightness
 
 	RESULTING_LED_STATUS="${RESULTING_LED_STATUS} ${led}:${status}"
 }
